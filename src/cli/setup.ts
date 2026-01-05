@@ -1067,8 +1067,13 @@ async function main() {
           moveTo(17, Math.floor((cols - 55) / 2));
           write(c.dim + 'Check terminal output above or try: npx wrangler deploy' + c.reset);
           
+          if (config.access === 'remote') {
+            moveTo(19, Math.floor((cols - 50) / 2));
+            write(c.yellow + '⚠ Remote access requires deployment to work' + c.reset);
+          }
+          
           config.deployed = false;
-          await sleep(3000);
+          await sleep(4000);
         }
       }
     } else {
