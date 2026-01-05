@@ -1025,14 +1025,17 @@ async function main() {
                 env: deployEnv,
               });
               
-              // Extract URL from output
-              const match = result.match(/https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev/i);
+              // Extract URL from output - handle various formats
+              const match = result.match(/https:\/\/[a-z0-9_-]+\.[a-z0-9_-]+\.workers\.dev/i) 
+                || result.match(/https:\/\/[^\s]+\.workers\.dev/i);
               if (match) {
-                deployUrl = match[0];
+                deployUrl = match[0].replace(/[.,]$/, ''); // trim trailing punctuation
               }
             } catch (e: any) {
-              const err = e.stdout || e.stderr || e.message || 'Deploy failed';
-              throw new Error(err.toString().split('\n')[0]);
+              // Log full error for debugging
+              const fullErr = e.stdout?.toString() || e.stderr?.toString() || e.message || '';
+              console.error('\n[Deploy Error]', fullErr);
+              throw new Error(fullErr.split('\n').find((l: string) => l.trim()) || 'Deploy failed');
             }
           });
           
@@ -1056,13 +1059,13 @@ async function main() {
           write(c.red + '✗ ' + c.white + 'Deployment failed' + c.reset);
           
           // Show actual error
-          const errMsg = e.stderr?.toString() || e.message || 'Unknown error';
-          const shortErr = errMsg.split('\n')[0].slice(0, 50);
+          const errMsg = e.message || e.stderr?.toString() || 'Unknown error';
+          const shortErr = errMsg.slice(0, 60);
           moveTo(15, Math.floor((cols - shortErr.length) / 2));
           write(c.dim + shortErr + c.reset);
           
-          moveTo(17, Math.floor((cols - 45) / 2));
-          write(c.dim + 'Try: npx wrangler login' + c.reset);
+          moveTo(17, Math.floor((cols - 55) / 2));
+          write(c.dim + 'Check terminal output above or try: npx wrangler deploy' + c.reset);
           
           config.deployed = false;
           await sleep(3000);
