@@ -984,38 +984,13 @@ async function main() {
         await clearContent();
         await drawStep(5, 5, 'Deploy', true);
         
-        // Set secrets and deploy
+        // Deploy first, then set secrets (to avoid creating orphan workers on failure)
         const agentDir = join(process.cwd(), 'cloudflare-agent');
         
         // Set account ID env var if provided
         const deployEnv = accountId ? { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId } : process.env;
         
         try {
-          await showProgress('Setting secrets...', async () => {
-            // Set each secret
-            const secrets = [
-              ['ANTHROPIC_API_KEY', config.anthropicKey],
-              ['BRIDGE_AUTH_TOKEN', config.authToken],
-              ['API_SECRET', config.authToken.slice(0, 32)],
-            ];
-            
-            for (const [key, value] of secrets) {
-              try {
-                execSync(`echo "${value}" | npx wrangler secret put ${key}`, {
-                  cwd: agentDir,
-                  stdio: 'pipe',
-                  env: deployEnv,
-                });
-              } catch (e) {
-                // Secret might already exist, continue
-              }
-            }
-            await sleep(500);
-          });
-          
-          await clearContent();
-          await drawStep(5, 5, 'Deploy', true);
-          
           let deployUrl = '';
           await showProgress('Deploying to Cloudflare...', async () => {
             try {
@@ -1040,6 +1015,31 @@ async function main() {
           });
           
           if (deployUrl) {
+            // Deploy succeeded - now set secrets
+            await clearContent();
+            await drawStep(5, 5, 'Deploy', true);
+            
+            await showProgress('Setting secrets...', async () => {
+              const secrets = [
+                ['ANTHROPIC_API_KEY', config.anthropicKey],
+                ['BRIDGE_AUTH_TOKEN', config.authToken],
+                ['API_SECRET', config.authToken.slice(0, 32)],
+              ];
+              
+              for (const [key, value] of secrets) {
+                try {
+                  execSync(`echo "${value}" | npx wrangler secret put ${key}`, {
+                    cwd: agentDir,
+                    stdio: 'pipe',
+                    env: deployEnv,
+                  });
+                } catch (e) {
+                  // Secret might already exist, continue
+                }
+              }
+              await sleep(500);
+            });
+            
             config.deployed = true;
             config.deployedUrl = deployUrl;
             if (accountId) config.cloudflareAccountId = accountId;
