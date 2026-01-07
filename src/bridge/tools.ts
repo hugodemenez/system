@@ -443,6 +443,76 @@ function generateExtensionTools(config: BridgeConfig): SystemTool[] {
  */
 export const coreTools: SystemTool[] = [
   {
+    name: 'raycast_search',
+    description: 'Open Raycast and type a search query. Raycast will find matching commands, apps, or actions. This is the easiest way to do anything on Mac.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'What to search for in Raycast (e.g., "tweet hello world", "create note", "play spotify", "open twitter")'
+        },
+        autoSend: {
+          type: 'boolean', 
+          description: 'Auto-submit with cmd+enter after a delay (default: true for tweets/posts)'
+        }
+      },
+      required: ['query']
+    },
+    handler: async (args) => {
+      const query = String(args.query);
+      const autoSend = args.autoSend !== false; // default true
+      
+      // Use fallbackText parameter which properly handles spaces
+      const url = `raycast://?fallbackText=${encodeURIComponent(query)}`;
+      await open(url);
+      
+      // If autoSend, wait for Raycast to process then send cmd+enter
+      if (autoSend) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        // Send cmd+enter to submit
+        await runAppleScript(`
+          tell application "System Events"
+            key code 36 using {command down}
+          end tell
+        `);
+      }
+      
+      return {
+        content: [{
+          type: 'text',
+          text: `Opened Raycast with: "${query}"${autoSend ? ' (auto-sent)' : ''}`
+        }]
+      };
+    }
+  },
+  {
+    name: 'raycast_confetti',
+    description: 'Trigger Raycast confetti celebration effect.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async () => {
+      await open('raycast://confetti');
+      return { content: [{ type: 'text', text: 'Confetti!' }] };
+    }
+  },
+  {
+    name: 'raycast_ai',
+    description: 'Ask Raycast AI a question or give it a task.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Question or task for Raycast AI' }
+      },
+      required: ['prompt']
+    },
+    handler: async (args) => {
+      const prompt = String(args.prompt);
+      const url = `raycast://ai?prompt=${encodeURIComponent(prompt)}`;
+      await open(url);
+      return { content: [{ type: 'text', text: `Asked Raycast AI: "${prompt}"` }] };
+    }
+  },
+  {
     name: 'raycast',
     description: 'Execute any Raycast extension command. Use format: extension "author/name", command "command-name". Check Raycast store for extension details.',
     inputSchema: {
@@ -1858,18 +1928,173 @@ export const systemTools: SystemTool[] = [
     }
   },
   {
-    name: 'send_imessage',
-    description: 'Send an iMessage to a contact. Requires confirmation before sending.',
+    name: 'read_imessages',
+    description: 'READ/VIEW iMessages - use this when user wants to see, check, or read messages. Use for: "what did X send", "show messages from X", "read my messages", "last texts from X". Pass phone number directly if known, or contact name to look up.',
     inputSchema: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: 'Phone number or email address of the recipient' },
+        from: { type: 'string', description: 'Phone number (preferred) or contact name to filter messages. Leave empty for all recent.' },
+        limit: { type: 'number', description: 'Number of messages to retrieve (default: 10, max: 50)' },
+        includeImages: { type: 'boolean', description: 'Include image attachments in response (default: false)' }
+      }
+    },
+    handler: async (args) => {
+      let from = args.from ? String(args.from).replace(/"/g, '\\"') : '';
+      const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
+      const includeImages = args.includeImages === true;
+      
+      try {
+        const homeDir = process.env.HOME || '/tmp';
+        const dbPath = `${homeDir}/Library/Messages/chat.db`;
+        
+        // Check if database exists and is readable
+        if (!existsSync(dbPath)) {
+          return { 
+            content: [{ type: 'text', text: 'Messages database not found. Make sure Messages app has been used on this Mac.' }], 
+            isError: true 
+          };
+        }
+        
+        // If 'from' looks like a name (not a phone number), try to look up the contact first
+        if (from && !/^[\d\+\-\(\)\s]+$/.test(from)) {
+          try {
+            const contactScript = `
+              tell application "Contacts"
+                set matchingPeople to (every person whose name contains "${from}")
+                if (count of matchingPeople) > 0 then
+                  set thePerson to item 1 of matchingPeople
+                  set thePhones to phones of thePerson
+                  if (count of thePhones) > 0 then
+                    return value of item 1 of thePhones
+                  end if
+                end if
+                return ""
+              end tell
+            `;
+            const phoneResult = await runAppleScript(contactScript);
+            if (phoneResult && phoneResult.trim()) {
+              from = phoneResult.trim().replace(/[\s\-\(\)]/g, '');
+            }
+          } catch {
+            // Continue with the name as-is, might still match
+          }
+        }
+        
+        // Query messages with attachment info
+        let sql = `
+          SELECT 
+            datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as date,
+            CASE WHEN m.is_from_me = 1 THEN 'Me' ELSE coalesce(h.id, 'Unknown') END as sender,
+            m.text,
+            m.ROWID as msg_id,
+            (SELECT GROUP_CONCAT(a.filename, '|||') 
+             FROM message_attachment_join maj 
+             JOIN attachment a ON maj.attachment_id = a.ROWID 
+             WHERE maj.message_id = m.ROWID) as attachments
+          FROM message m
+          LEFT JOIN handle h ON m.handle_id = h.ROWID
+          WHERE 1=1
+        `;
+        
+        if (from) {
+          // Clean the phone number for matching
+          const cleanPhone = from.replace(/[^0-9]/g, '');
+          sql += ` AND (h.id LIKE '%${cleanPhone}%' OR h.id LIKE '%${from}%')`;
+        }
+        
+        sql += ` ORDER BY m.date DESC LIMIT ${limit}`;
+        
+        const { stdout, stderr } = await execCommand('sqlite3', ['-separator', ' | ', dbPath, sql]);
+        
+        if (stderr && stderr.includes('unable to open database')) {
+          return { 
+            content: [{ type: 'text', text: 'Cannot access Messages database. Grant Full Disk Access to Terminal/the bridge app in System Preferences > Privacy & Security > Full Disk Access.' }], 
+            isError: true 
+          };
+        }
+        
+        if (!stdout.trim()) {
+          return { content: [{ type: 'text', text: from ? `No messages found from "${from}"` : 'No recent messages found' }] };
+        }
+        
+        const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+        const lines = stdout.trim().split('\n');
+        let textOutput = '';
+        
+        for (const line of lines) {
+          const parts = line.split(' | ');
+          const date = parts[0];
+          const sender = parts[1];
+          const text = parts[2] || '';
+          const attachments = parts[4] || '';
+          
+          let msgLine = `[${date}] ${sender}: ${text || '(no text)'}`;
+          
+          if (attachments) {
+            const files = attachments.split('|||').filter(Boolean);
+            const imageFiles = files.filter(f => /\.(jpg|jpeg|png|gif|heic)$/i.test(f));
+            const otherFiles = files.filter(f => !/\.(jpg|jpeg|png|gif|heic)$/i.test(f));
+            
+            if (imageFiles.length > 0) {
+              msgLine += ` [${imageFiles.length} image(s)]`;
+            }
+            if (otherFiles.length > 0) {
+              msgLine += ` [${otherFiles.length} attachment(s)]`;
+            }
+            
+            // If includeImages, read and encode the first image
+            if (includeImages && imageFiles.length > 0) {
+              for (const imgPath of imageFiles.slice(0, 2)) { // Max 2 images per message
+                try {
+                  const fullPath = imgPath.replace('~', homeDir);
+                  if (existsSync(fullPath)) {
+                    const imgBuffer = readFileSync(fullPath);
+                    const ext = imgPath.split('.').pop()?.toLowerCase();
+                    const mimeType = ext === 'png' ? 'image/png' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+                    
+                    content.push({
+                      type: 'text',
+                      text: `\n--- Image from ${sender} at ${date} ---`
+                    });
+                    content.push({
+                      type: 'image',
+                      data: imgBuffer.toString('base64'),
+                      mimeType
+                    });
+                  }
+                } catch {}
+              }
+            }
+          }
+          
+          textOutput += msgLine + '\n';
+        }
+        
+        // Add text summary first
+        content.unshift({ type: 'text', text: textOutput.trim() });
+        
+        return { content };
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Error reading messages: ${error instanceof Error ? error.message : 'Unknown'}. Make sure Full Disk Access is granted in System Preferences > Privacy.` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'send_imessage',
+    description: 'SEND iMessage - use this when user wants to send/text someone. Pass phone number directly if known, or contact name to look up.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Phone number (preferred) or contact name of the recipient' },
         message: { type: 'string', description: 'The message to send' }
       },
       required: ['to', 'message']
     },
     handler: async (args) => {
-      const to = String(args.to).replace(/"/g, '\\"');
+      let to = String(args.to).replace(/"/g, '\\"');
       const message = String(args.message).replace(/"/g, '\\"');
       
       if (!to || !message) {
@@ -1877,6 +2102,39 @@ export const systemTools: SystemTool[] = [
       }
       
       try {
+        // If 'to' looks like a name (not a phone number), try to look up the contact first
+        if (!/^[\d\+\-\(\)\s]+$/.test(to)) {
+          try {
+            const contactScript = `
+              tell application "Contacts"
+                set matchingPeople to (every person whose name contains "${to}")
+                if (count of matchingPeople) > 0 then
+                  set thePerson to item 1 of matchingPeople
+                  set thePhones to phones of thePerson
+                  if (count of thePhones) > 0 then
+                    return value of item 1 of thePhones
+                  end if
+                end if
+                return ""
+              end tell
+            `;
+            const phoneResult = await runAppleScript(contactScript);
+            if (phoneResult && phoneResult.trim()) {
+              to = phoneResult.trim();
+            } else {
+              return { 
+                content: [{ type: 'text', text: `Could not find phone number for contact "${args.to}". Try using a phone number directly.` }], 
+                isError: true 
+              };
+            }
+          } catch (contactError) {
+            return { 
+              content: [{ type: 'text', text: `Could not look up contact "${args.to}". Try using a phone number directly.` }], 
+              isError: true 
+            };
+          }
+        }
+        
         const script = `
           tell application "Messages"
             set targetService to 1st account whose service type = iMessage
@@ -1885,7 +2143,7 @@ export const systemTools: SystemTool[] = [
           end tell
         `;
         await runAppleScript(script);
-        return { content: [{ type: 'text', text: `Message sent to ${to}` }] };
+        return { content: [{ type: 'text', text: `Message sent to ${args.to}${to !== args.to ? ` (${to})` : ''}` }] };
       } catch (error) {
         return { 
           content: [{ type: 'text', text: `Error sending message: ${error instanceof Error ? error.message : 'Unknown'}` }], 
@@ -1972,6 +2230,335 @@ export const systemTools: SystemTool[] = [
         try { unlinkSync(resizedFile); } catch {}
         return { 
           content: [{ type: 'text', text: `Screenshot failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  // ═══════════════════════════════════════════════════════════════
+  // Mouse/Keyboard Tools (Low-level fallbacks - prefer Raycast)
+  // ═══════════════════════════════════════════════════════════════
+  {
+    name: 'mouse_click',
+    description: 'Click at specific x,y coordinates. Low-level fallback - prefer raycast_search for most tasks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'X coordinate (pixels from left)' },
+        y: { type: 'number', description: 'Y coordinate (pixels from top)' },
+        button: { type: 'string', enum: ['left', 'right'], description: 'Mouse button (default: left)' },
+        clicks: { type: 'number', description: 'Number of clicks (1 for single, 2 for double)' }
+      },
+      required: ['x', 'y']
+    },
+    handler: async (args) => {
+      const x = Math.round(Number(args.x));
+      const y = Math.round(Number(args.y));
+      const button = args.button === 'right' ? 'right' : 'left';
+      const clicks = args.clicks === 2 ? 2 : 1;
+      
+      try {
+        // Try cliclick first (more reliable), fall back to AppleScript
+        try {
+          const clickCmd = button === 'right' ? 'rc' : (clicks === 2 ? 'dc' : 'c');
+          await execCommand('cliclick', [`${clickCmd}:${x},${y}`]);
+          return { content: [{ type: 'text', text: `Clicked at (${x}, ${y})` }] };
+        } catch {
+          // Fallback to AppleScript + Python (cliclick not installed)
+          const script = `
+            do shell script "python3 -c \\"
+import Quartz
+point = (${x}, ${y})
+event = Quartz.CGEventCreateMouseEvent(None, ${button === 'right' ? 'Quartz.kCGEventRightMouseDown' : 'Quartz.kCGEventLeftMouseDown'}, point, ${button === 'right' ? 'Quartz.kCGMouseButtonRight' : 'Quartz.kCGMouseButtonLeft'})
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+event = Quartz.CGEventCreateMouseEvent(None, ${button === 'right' ? 'Quartz.kCGEventRightMouseUp' : 'Quartz.kCGEventLeftMouseUp'}, point, ${button === 'right' ? 'Quartz.kCGMouseButtonRight' : 'Quartz.kCGMouseButtonLeft'})
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+${clicks === 2 ? `
+event = Quartz.CGEventCreateMouseEvent(None, ${button === 'right' ? 'Quartz.kCGEventRightMouseDown' : 'Quartz.kCGEventLeftMouseDown'}, point, ${button === 'right' ? 'Quartz.kCGMouseButtonRight' : 'Quartz.kCGMouseButtonLeft'})
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+event = Quartz.CGEventCreateMouseEvent(None, ${button === 'right' ? 'Quartz.kCGEventRightMouseUp' : 'Quartz.kCGEventLeftMouseUp'}, point, ${button === 'right' ? 'Quartz.kCGMouseButtonRight' : 'Quartz.kCGMouseButtonLeft'})
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+` : ''}\\""
+          `;
+          await runAppleScript(script);
+          return { content: [{ type: 'text', text: `Clicked at (${x}, ${y})` }] };
+        }
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Click failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'mouse_move',
+    description: 'Move mouse to specific x,y coordinates without clicking.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'X coordinate (pixels from left)' },
+        y: { type: 'number', description: 'Y coordinate (pixels from top)' }
+      },
+      required: ['x', 'y']
+    },
+    handler: async (args) => {
+      const x = Math.round(Number(args.x));
+      const y = Math.round(Number(args.y));
+      
+      try {
+        try {
+          await execCommand('cliclick', [`m:${x},${y}`]);
+          return { content: [{ type: 'text', text: `Moved mouse to (${x}, ${y})` }] };
+        } catch {
+          const script = `
+            do shell script "python3 -c \\"
+import Quartz
+point = (${x}, ${y})
+event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft)
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+\\""
+          `;
+          await runAppleScript(script);
+          return { content: [{ type: 'text', text: `Moved mouse to (${x}, ${y})` }] };
+        }
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Mouse move failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'keyboard_type',
+    description: 'Type text at the current cursor position. Use after clicking into a text field.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Text to type' }
+      },
+      required: ['text']
+    },
+    handler: async (args) => {
+      const text = String(args.text);
+      
+      try {
+        try {
+          // cliclick can type text
+          await execCommand('cliclick', [`t:${text}`]);
+          return { content: [{ type: 'text', text: `Typed: "${text}"` }] };
+        } catch {
+          // Fallback to AppleScript
+          const escapedText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          const script = `
+            tell application "System Events"
+              keystroke "${escapedText}"
+            end tell
+          `;
+          await runAppleScript(script);
+          return { content: [{ type: 'text', text: `Typed: "${text}"` }] };
+        }
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Type failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'keyboard_key',
+    description: 'Press a key or key combination (e.g., "return", "cmd+a", "cmd+shift+s").',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Key to press (e.g., "return", "escape", "tab", "space", "delete", "up", "down", "left", "right")' },
+        modifiers: { 
+          type: 'array', 
+          items: { type: 'string', enum: ['cmd', 'ctrl', 'alt', 'shift'] },
+          description: 'Modifier keys to hold (e.g., ["cmd", "shift"])'
+        }
+      },
+      required: ['key']
+    },
+    handler: async (args) => {
+      const key = String(args.key).toLowerCase();
+      const modifiers = (args.modifiers as string[] || []).map(m => String(m).toLowerCase());
+      
+      // Map common key names to AppleScript key codes
+      const keyMap: Record<string, string> = {
+        'return': 'return', 'enter': 'return',
+        'escape': 'escape', 'esc': 'escape',
+        'tab': 'tab',
+        'space': 'space',
+        'delete': 'delete', 'backspace': 'delete',
+        'up': 'up arrow', 'down': 'down arrow', 'left': 'left arrow', 'right': 'right arrow',
+        'home': 'home', 'end': 'end',
+        'pageup': 'page up', 'pagedown': 'page down',
+      };
+      
+      const appleKey = keyMap[key] || key;
+      const modifierStr = modifiers.map(m => {
+        if (m === 'cmd' || m === 'command') return 'command down';
+        if (m === 'ctrl' || m === 'control') return 'control down';
+        if (m === 'alt' || m === 'option') return 'option down';
+        if (m === 'shift') return 'shift down';
+        return '';
+      }).filter(Boolean).join(', ');
+      
+      try {
+        const script = modifierStr
+          ? `tell application "System Events" to key code (key code of "${appleKey}") using {${modifierStr}}`
+          : `tell application "System Events" to keystroke "${appleKey}"`;
+        
+        // Simple approach: use keystroke for regular keys, key code for special
+        const isSpecialKey = ['return', 'escape', 'tab', 'delete', 'up arrow', 'down arrow', 'left arrow', 'right arrow', 'home', 'end', 'page up', 'page down', 'space'].includes(appleKey);
+        
+        if (isSpecialKey) {
+          const keyCodes: Record<string, number> = {
+            'return': 36, 'escape': 53, 'tab': 48, 'delete': 51, 'space': 49,
+            'up arrow': 126, 'down arrow': 125, 'left arrow': 123, 'right arrow': 124,
+            'home': 115, 'end': 119, 'page up': 116, 'page down': 121,
+          };
+          const code = keyCodes[appleKey] || 36;
+          const keyScript = modifierStr
+            ? `tell application "System Events" to key code ${code} using {${modifierStr}}`
+            : `tell application "System Events" to key code ${code}`;
+          await runAppleScript(keyScript);
+        } else {
+          const keyScript = modifierStr
+            ? `tell application "System Events" to keystroke "${appleKey}" using {${modifierStr}}`
+            : `tell application "System Events" to keystroke "${appleKey}"`;
+          await runAppleScript(keyScript);
+        }
+        
+        const displayKey = modifiers.length > 0 ? `${modifiers.join('+')}+${key}` : key;
+        return { content: [{ type: 'text', text: `Pressed: ${displayKey}` }] };
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Key press failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'mouse_drag',
+    description: 'Click and drag from one point to another.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fromX: { type: 'number', description: 'Starting X coordinate' },
+        fromY: { type: 'number', description: 'Starting Y coordinate' },
+        toX: { type: 'number', description: 'Ending X coordinate' },
+        toY: { type: 'number', description: 'Ending Y coordinate' }
+      },
+      required: ['fromX', 'fromY', 'toX', 'toY']
+    },
+    handler: async (args) => {
+      const fromX = Math.round(Number(args.fromX));
+      const fromY = Math.round(Number(args.fromY));
+      const toX = Math.round(Number(args.toX));
+      const toY = Math.round(Number(args.toY));
+      
+      try {
+        try {
+          await execCommand('cliclick', [`dd:${fromX},${fromY}`, `du:${toX},${toY}`]);
+          return { content: [{ type: 'text', text: `Dragged from (${fromX}, ${fromY}) to (${toX}, ${toY})` }] };
+        } catch {
+          const script = `
+            do shell script "python3 -c \\"
+import Quartz
+import time
+# Mouse down at start
+event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (${fromX}, ${fromY}), Quartz.kCGMouseButtonLeft)
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+time.sleep(0.1)
+# Drag to end
+event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDragged, (${toX}, ${toY}), Quartz.kCGMouseButtonLeft)
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+time.sleep(0.1)
+# Mouse up
+event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (${toX}, ${toY}), Quartz.kCGMouseButtonLeft)
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+\\""
+          `;
+          await runAppleScript(script);
+          return { content: [{ type: 'text', text: `Dragged from (${fromX}, ${fromY}) to (${toX}, ${toY})` }] };
+        }
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Drag failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'scroll',
+    description: 'Scroll up or down at current mouse position.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        direction: { type: 'string', enum: ['up', 'down'], description: 'Scroll direction' },
+        amount: { type: 'number', description: 'Scroll amount (default: 3 lines)' }
+      },
+      required: ['direction']
+    },
+    handler: async (args) => {
+      const direction = args.direction === 'up' ? 'up' : 'down';
+      const amount = Math.abs(Number(args.amount) || 3);
+      const scrollValue = direction === 'up' ? amount : -amount;
+      
+      try {
+        try {
+          // cliclick scroll: positive = up, negative = down
+          await execCommand('cliclick', [`w:${direction === 'up' ? '' : '-'}${amount}`]);
+          return { content: [{ type: 'text', text: `Scrolled ${direction} ${amount} units` }] };
+        } catch {
+          const script = `
+            do shell script "python3 -c \\"
+import Quartz
+event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitLine, 1, ${scrollValue})
+Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+\\""
+          `;
+          await runAppleScript(script);
+          return { content: [{ type: 'text', text: `Scrolled ${direction} ${amount} units` }] };
+        }
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Scroll failed: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
+          isError: true 
+        };
+      }
+    }
+  },
+  {
+    name: 'get_screen_size',
+    description: 'Get the screen dimensions (useful for calculating click coordinates).',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async () => {
+      try {
+        const script = `
+          tell application "Finder"
+            set screenBounds to bounds of window of desktop
+            return (item 3 of screenBounds) & "x" & (item 4 of screenBounds)
+          end tell
+        `;
+        const { stdout } = await execCommand('osascript', ['-e', `
+          use framework "AppKit"
+          set screenFrame to current application's NSScreen's mainScreen()'s frame()
+          set screenWidth to item 1 of item 2 of screenFrame
+          set screenHeight to item 2 of item 2 of screenFrame
+          return (screenWidth as integer) & "x" & (screenHeight as integer)
+        `]);
+        const [width, height] = stdout.trim().split('x').map(Number);
+        return { content: [{ type: 'text', text: `Screen size: ${width}x${height}` }] };
+      } catch (error) {
+        return { 
+          content: [{ type: 'text', text: `Failed to get screen size: ${error instanceof Error ? error.message : 'Unknown error'}` }], 
           isError: true 
         };
       }

@@ -384,10 +384,13 @@ export class SystemAgent extends Agent<Env, SystemState> {
       this.setState({ ...this.state, pendingAction: undefined });
     }
     
-    // Process with Claude
+    // Step 1: Quick intent classification with Haiku
+    const intent = await this.classifyIntent(message);
+    
+    // Step 2: Process with Claude using intent-aware context
     const tools = await this.fetchTools();
     const messages: Message[] = [...this.state.history.slice(-40), { role: "user" as const, content: message }];
-    const systemPrompt = this.buildSystemPrompt(tools);
+    const systemPrompt = this.buildSystemPrompt(tools, intent);
     const response = await this.callClaude(systemPrompt, messages);
     const { text, actions, schedule } = this.parseResponse(response);
     
@@ -596,16 +599,34 @@ JUST describe what's visible in the screenshot. Keep it brief.`,
     return isNaN(parsed.getTime()) ? new Date(now + 60000) : parsed;
   }
 
-  buildSystemPrompt(tools: Tool[]): string {
+  buildSystemPrompt(tools: Tool[], intent?: string): string {
     // Separate core tools from extension tools
     // HIDE send_imessage from Claude - it's handled internally after search_contacts
     const coreTools = tools.filter(t => 
       t.name !== 'send_imessage' && (
         !t.name.includes('_') || 
-        ['music_', 'volume_', 'calendar_', 'reminders_', 'battery_', 'wifi_', 'storage_', 'running_', 'front_', 'brightness_', 'dark_mode_', 'dnd_', 'lock_', 'sleep_', 'notes_', 'finder_', 'shortcut_', 'browser_', 'clipboard_', 'search_'].some(p => t.name.startsWith(p))
+        ['music_', 'volume_', 'calendar_', 'reminders_', 'battery_', 'wifi_', 'storage_', 'running_', 'front_', 'brightness_', 'dark_mode_', 'dnd_', 'lock_', 'sleep_', 'notes_', 'finder_', 'shortcut_', 'browser_', 'clipboard_', 'search_', 'read_'].some(p => t.name.startsWith(p))
       )
     );
     const extensionTools = tools.filter(t => !coreTools.includes(t) && t.name.includes('_') && t.name !== 'send_imessage');
+    
+    // Intent-specific guidance
+    const intentGuidance: Record<string, string> = {
+      messages_read: `\n⚡ INTENT DETECTED: Reading messages. Use read_imessages tool. Do NOT use search_contacts (that's for sending).`,
+      messages_send: `\n⚡ INTENT DETECTED: Sending a message. Use search_contacts to find the contact, then confirm before sending.`,
+      music: `\n⚡ INTENT DETECTED: Music control. Use music_* tools or raycast_search for Spotify.`,
+      system: `\n⚡ INTENT DETECTED: System control. Use appropriate system tools (volume, brightness, battery, screenshot, etc.)`,
+      calendar: `\n⚡ INTENT DETECTED: Calendar. Use calendar_* tools.`,
+      reminders: `\n⚡ INTENT DETECTED: Reminders. Use reminders_* tools.`,
+      notes: `\n⚡ INTENT DETECTED: Notes. Use notes_* tools.`,
+      files: `\n⚡ INTENT DETECTED: Files. Use finder_* tools.`,
+      apps: `\n⚡ INTENT DETECTED: App control. Use open_app tool.`,
+      web: `\n⚡ INTENT DETECTED: Web/social. Use open_url or raycast_search.`,
+      raycast: `\n⚡ INTENT DETECTED: General automation. Consider using raycast_search.`,
+      conversation: `\n⚡ INTENT DETECTED: Conversation. Just respond naturally, no tools needed.`,
+    };
+    
+    const intentHint = intent && intentGuidance[intent] ? intentGuidance[intent] : '';
     
     const coreDesc = coreTools.map(t => `- ${t.name}: ${t.description}`).join("\n");
     
@@ -632,6 +653,7 @@ JUST describe what's visible in the screenshot. Keep it brief.`,
       : "";
     
     return `You are SYSTEM, a personal AI assistant that controls a Mac remotely. Be helpful and concise.
+${intentHint}
 
 USER PREFERENCES:
 ${prefs}${screenshotContext}
@@ -646,23 +668,19 @@ IMPORTANT: For Raycast extensions, use the EXACT tool name from the list above (
 MUSIC: music_play, music_pause, music_next, music_previous, music_current
 VOLUME: volume_up, volume_down, volume_set, volume_mute, volume_get
 MESSAGING (iMessage/SMS):
-  ⚠️ ONLY way to send messages: use search_contacts tool
-  ⚠️ NEVER use applescript to send messages - it won't work!
+  READ vs SEND - pick the right one!
   
-  Flow:
-  1. If user uses a nickname (wife, mom, boss), check USER PREFERENCES for the real name
-  2. Call search_contacts with the real name AND the message to send
-  3. System handles confirmation and sending automatically
+  📖 READING messages (what did X say, show messages from X, last messages):
+     → Use read_imessages tool directly
+     → Example: "what did my wife text me?" → read_imessages with from: "Meghan" (from preferences)
   
-  IMPORTANT: Rewrite the message from the sender's perspective!
-  - "tell her I love her" → "I love you" (speaking TO her, not about her)
-  - "let him know I'm running late" → "I'm running late"
-  - "ask her if she wants dinner" → "Do you want dinner?"
+  ✉️ SENDING messages (text X, tell X, send X a message):
+     → Use search_contacts flow (finds contact, confirms before sending)
+     → Rewrite message from sender's perspective: "tell her I love her" → "I love you"
   
-  Example: "text my wife and tell her I love her"
-  - Check USER PREFERENCES: wife -> (stored name)
-  - Rewrite message for recipient: "I love you"
-  - Call: {"tool": "search_contacts", "args": {"query": "(name)", "message": "I love you"}}
+  KEYWORDS:
+  - "read", "show", "what did", "last messages", "check messages" → read_imessages
+  - "text", "send", "tell", "message X saying" → search_contacts (send flow)
 CALENDAR: calendar_today, calendar_upcoming, calendar_next, calendar_create
 REMINDERS: reminders_list, reminders_create, reminders_complete
 SYSTEM: battery_status, wifi_status, storage_status, running_apps, front_app
@@ -675,6 +693,32 @@ BROWSER: browser_url, browser_tabs
 APPS: open_app, open_url
 OTHER: screenshot, notify, say, clipboard_get, clipboard_set
 TIMING: wait (for seconds-based delays in immediate sequences)
+RAYCAST (preferred for most tasks):
+- raycast_search: Open Raycast with a search query - it finds the right action
+- raycast_ai: Ask Raycast AI to do something
+- raycast: Run specific extension commands
+
+===== RAYCAST-FIRST APPROACH =====
+
+For most tasks, use raycast_search - it's the most reliable way to do things on Mac:
+
+\`\`\`action
+{"tool": "raycast_search", "args": {"query": "tweet hello world"}}
+\`\`\`
+
+\`\`\`action
+{"tool": "raycast_search", "args": {"query": "create note meeting notes"}}
+\`\`\`
+
+\`\`\`action
+{"tool": "raycast_search", "args": {"query": "play spotify chill vibes"}}
+\`\`\`
+
+\`\`\`action
+{"tool": "raycast_search", "args": {"query": "open twitter"}}
+\`\`\`
+
+Raycast can: open apps, search the web, control Spotify, post to social media, create notes, manage tasks, and much more based on installed extensions.
 
 ===== ACTION FORMAT =====
 
@@ -780,6 +824,54 @@ Be brief. Don't explain - just do it.`;
     return { text: text || "Done!", actions, schedule };
   }
 
+  /**
+   * Fast intent classification using Haiku
+   * Returns the category of task to help Sonnet pick the right tools
+   */
+  async classifyIntent(message: string): Promise<string> {
+    const classifierPrompt = `Classify this user request into ONE category. Reply with ONLY the category name.
+
+Categories:
+- messages_read: Reading/viewing messages, texts, what someone sent
+- messages_send: Sending texts, telling someone something, messaging
+- music: Playing, pausing, controlling music/spotify/apple music
+- system: Volume, brightness, battery, wifi, screenshots, system info
+- calendar: Events, meetings, schedule, calendar
+- reminders: Todos, reminders, tasks
+- notes: Creating, reading, searching notes
+- files: Finding files, downloads, desktop, finder
+- apps: Opening apps, switching apps
+- web: Opening URLs, browsing, twitter, social media posts
+- raycast: General automation, anything else
+- conversation: Casual chat, questions, not a command
+
+User request: "${message.replace(/"/g, '\\"')}"
+
+Category:`;
+
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": this.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({ 
+          model: "claude-3-5-haiku-20241022", 
+          max_tokens: 20, 
+          messages: [{ role: "user", content: classifierPrompt }] 
+        }),
+      });
+
+      if (!response.ok) return "raycast"; // Default fallback
+      const data = await response.json() as { content: { text: string }[] };
+      return data.content[0]?.text?.trim().toLowerCase().replace(/[^a-z_]/g, '') || "raycast";
+    } catch {
+      return "raycast"; // Default fallback on error
+    }
+  }
+
   async callClaude(systemPrompt: string, messages: Message[]): Promise<string> {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -788,7 +880,7 @@ Be brief. Don't explain - just do it.`;
         "x-api-key": this.env.ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 4096, system: systemPrompt, messages }),
+      body: JSON.stringify({ model: "claude-opus-4-5-20251101", max_tokens: 4096, system: systemPrompt, messages }),
     });
 
     if (!response.ok) throw new Error(`Claude API error: ${response.status}`);
@@ -833,7 +925,7 @@ Be brief. Don't explain - just do it.`;
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({ 
-        model: "claude-sonnet-4-20250514", 
+        model: "claude-opus-4-5-20251101", 
         max_tokens: 4096, 
         system: systemPrompt, 
         messages: visionMessages 
