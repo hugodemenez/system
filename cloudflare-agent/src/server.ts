@@ -206,6 +206,7 @@ export class SystemAgent extends Agent<Env, SystemState> {
 
   /**
    * Create a new conversation and make it active
+   * Also cleans up any existing empty conversations
    */
   createConversation(title?: string): Conversation {
     const id = this.generateConversationId();
@@ -217,10 +218,19 @@ export class SystemAgent extends Agent<Env, SystemState> {
       updatedAt: Date.now(),
     };
     
+    // Clean up empty conversations before creating new one
     const existingConversations = this.state.conversations || {};
+    const cleanedConversations: Record<string, Conversation> = {};
+    for (const [convId, conv] of Object.entries(existingConversations)) {
+      // Keep conversations that have messages
+      if (conv.history && conv.history.length > 0) {
+        cleanedConversations[convId] = conv;
+      }
+    }
+    
     this.setState({
       ...this.state,
-      conversations: { ...existingConversations, [id]: conversation },
+      conversations: { ...cleanedConversations, [id]: conversation },
       activeConversationId: id,
     });
     
