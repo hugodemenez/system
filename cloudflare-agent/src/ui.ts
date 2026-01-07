@@ -576,13 +576,9 @@ export const chatHTML = `<!DOCTYPE html>
       // Load conversations
       await loadConversations();
       
-      // Auto-create new conversation if none exist
-      if (conversations.length === 0) {
-        await createNewConversation();
-      } else if (!activeConversationId) {
-        // Select the most recent conversation
-        await switchToConversation(conversations[0].id);
-      }
+      // Always start with a fresh conversation on page load
+      // Users can switch to old conversations via the sidebar
+      await createNewConversation();
       
       setTimeout(connectWebSocket, 500);
       

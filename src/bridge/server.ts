@@ -6,7 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { allTools } from './tools.js';
+import { allTools } from './tools/index.js';
 
 /**
  * Raycast MCP Bridge Server

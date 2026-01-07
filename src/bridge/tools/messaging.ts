@@ -59,11 +59,13 @@ export const messagingTools: SystemTool[] = [
           }
         }
         
+        // Use JSON output mode to handle complex data properly
         let sql = `
           SELECT 
             datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') as date,
             CASE WHEN m.is_from_me = 1 THEN 'Me' ELSE coalesce(h.id, 'Unknown') END as sender,
             m.text,
+            hex(m.attributedBody) as attributed_body_hex,
             m.ROWID as msg_id,
             (SELECT GROUP_CONCAT(a.filename, '|||') 
              FROM message_attachment_join maj 
@@ -81,7 +83,7 @@ export const messagingTools: SystemTool[] = [
         
         sql += ` ORDER BY m.date DESC LIMIT ${limit}`;
         
-        const { stdout, stderr } = await execCommand('sqlite3', ['-separator', ' | ', dbPath, sql]);
+        const { stdout, stderr } = await execCommand('sqlite3', ['-json', dbPath, sql]);
         
         if (stderr && stderr.includes('unable to open database')) {
           return { 
@@ -90,22 +92,57 @@ export const messagingTools: SystemTool[] = [
           };
         }
         
-        if (!stdout.trim()) {
+        if (!stdout.trim() || stdout.trim() === '[]') {
           return { content: [{ type: 'text', text: from ? `No messages found from "${from}"` : 'No recent messages found' }] };
         }
         
+        // Helper function to extract text from NSAttributedString blob
+        const extractTextFromAttributedBody = (hexString: string): string => {
+          if (!hexString) return '';
+          try {
+            const buffer = Buffer.from(hexString, 'hex');
+            // Look for NSString marker followed by 0x01 0x2B (length marker)
+            const nsStringMarker = Buffer.from('4E53537472696E67', 'hex'); // "NSString"
+            let idx = buffer.indexOf(nsStringMarker);
+            if (idx === -1) return '';
+            
+            // Search for the 0x01 0x2B pattern after NSString
+            const searchStart = idx + 8;
+            const remaining = buffer.slice(searchStart);
+            const markerIdx = remaining.indexOf(Buffer.from([0x01, 0x2B]));
+            if (markerIdx === -1) return '';
+            
+            const lengthByte = remaining[markerIdx + 2];
+            const textStart = markerIdx + 3;
+            const text = remaining.slice(textStart, textStart + lengthByte).toString('utf-8');
+            return text;
+          } catch {
+            return '';
+          }
+        };
+        
         const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
-        const lines = stdout.trim().split('\n');
+        let messages: Array<{date: string; sender: string; text: string | null; attributed_body_hex: string | null; msg_id: number; attachments: string | null}>;
+        
+        try {
+          messages = JSON.parse(stdout);
+        } catch {
+          return { content: [{ type: 'text', text: 'Failed to parse messages database response' }], isError: true };
+        }
+        
         let textOutput = '';
         
-        for (const line of lines) {
-          const parts = line.split(' | ');
-          const date = parts[0];
-          const sender = parts[1];
-          const text = parts[2] || '';
-          const attachments = parts[4] || '';
+        for (const msg of messages) {
+          const date = msg.date;
+          const sender = msg.sender;
+          // Try text field first, then extract from attributedBody for iOS 16+ messages
+          let text = msg.text || '';
+          if (!text && msg.attributed_body_hex) {
+            text = extractTextFromAttributedBody(msg.attributed_body_hex);
+          }
+          const attachments = msg.attachments || '';
           
-          let msgLine = `[${date}] ${sender}: ${text || '(no text)'}`;
+          let msgLine = `[${date}] ${sender}: ${text || '(media only)'}`;
           
           if (attachments) {
             const files = attachments.split('|||').filter(Boolean);
