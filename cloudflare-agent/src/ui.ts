@@ -128,7 +128,7 @@ export const chatHTML = `<!DOCTYPE html>
       justify-content: center;
       transition: all 0.15s;
       padding: 0;
-      padding-bottom: 2px;
+      padding-bottom: 4px;
     }
     .sidebar-toggle:hover { color: var(--text); border-color: var(--border-bright); }
 
@@ -165,6 +165,7 @@ export const chatHTML = `<!DOCTYPE html>
       transition: all 0.15s;
       display: flex;
       align-items: center;
+      padding-bottom:3px;
       justify-content: center;
     }
     .header-btn:hover { color: var(--text); border-color: var(--border-bright); background: var(--bg-subtle); }

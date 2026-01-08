@@ -37,6 +37,14 @@ start-tunnel.sh
 .wrangler/
 .mf/
 
+# Test files
+test-*.ts
+
+# Temporary images
+cloudflare-agent/*.jpeg
+cloudflare-agent/*.jpg
+cloudflare-agent/public/*.png
+
 # Keep example files
 !*.example
 !*.example.*
