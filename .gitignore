@@ -49,3 +49,10 @@ cloudflare-agent/public/*.png
 !*.example
 !*.example.*
 !bridge.config.example.json
+# Tauri build artifacts
+app/src-tauri/target/
+app/dist/
+app/node_modules/
+
+# Binaries (will be downloaded separately)
+app/src-tauri/binaries/
